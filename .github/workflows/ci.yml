@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate extension
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out extension
+        uses: actions/checkout@v4
+        with:
+          path: testwitness-extension
+
+      - name: Check out TestWitness core
+        uses: actions/checkout@v4
+        with:
+          repository: shashibeit/testwitness
+          ref: b4bec579c8d47fe1702a40ff0384da865260992e
+          path: testwitness
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            testwitness/package-lock.json
+            testwitness-extension/package-lock.json
+
+      - name: Install and build core
+        working-directory: testwitness
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install extension dependencies
+        working-directory: testwitness-extension
+        run: npm ci
+
+      - name: Validate extension
+        working-directory: testwitness-extension
+        run: npm run validate

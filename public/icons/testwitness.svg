@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title">
+  <title id="title">TestWitness</title>
+  <defs>
+    <linearGradient id="background" x1="16" y1="8" x2="112" y2="120" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#102a43"/>
+      <stop offset="0.55" stop-color="#123f5d"/>
+      <stop offset="1" stop-color="#0b7a75"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="26" fill="url(#background)"/>
+  <path d="M25 34h78v15H72v48H56V49H25V34Z" fill="#fff"/>
+  <path d="m76 57 10 21 9-21h17L94 98H80L62 57h14Z" fill="#67e8f9"/>
+</svg>
