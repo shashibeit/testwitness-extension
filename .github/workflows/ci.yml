@@ -21,19 +21,19 @@ jobs:
 
     steps:
       - name: Check out extension
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: testwitness-extension
 
       - name: Check out TestWitness core
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: shashibeit/testwitness
           ref: b4bec579c8d47fe1702a40ff0384da865260992e
           path: testwitness
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: npm
