@@ -34,7 +34,7 @@
     "validate": "npm run test && npm run typecheck && npm run lint && npm run format:check && npm run build"
   },
   "dependencies": {
-    "@testwitness/core": "file:../testwitness"
+    "@testwitness/core": "0.1.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

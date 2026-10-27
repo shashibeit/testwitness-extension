@@ -275,6 +275,319 @@ describe("ExtensionSessionCoordinator", () => {
     ).rejects.toMatchObject({ code: "SESSION_ALREADY_ACTIVE" });
   });
 
+  it("marks an interrupted startup as failed and permits a retry", async () => {
+    const browser = createBrowser();
+    const successfulSendToTab = browser.sendToTab;
+    let configureAttempts = 0;
+    browser.sendToTab = vi.fn(
+      async (tabId: number, message: unknown): Promise<ContentResponse> => {
+        if ((message as { type: string }).type === "worker:configure") {
+          configureAttempts += 1;
+          if (configureAttempts === 1) {
+            return {
+              ok: false,
+              message: "The page bridge did not become ready.",
+            };
+          }
+        }
+        return successfulSendToTab(tabId, message);
+      },
+    );
+    let currentTime = Date.parse("2026-09-26T12:00:00.000Z");
+    const coordinator = new ExtensionSessionCoordinator({
+      repository,
+      browser,
+      screenshots: createScreenshots(),
+      now: () => new Date((currentTime += 1_000)),
+    });
+
+    await expect(
+      coordinator.handlePanel({
+        version: 1,
+        type: "panel:start",
+        input: startInput(),
+      }),
+    ).rejects.toMatchObject({ code: "INSTRUMENTATION_FAILED" });
+
+    const failed = await repository.getLatestSession();
+    expect(failed).toMatchObject({
+      phase: "failed",
+      pageAccess: "degraded",
+      videoStatus: "off",
+    });
+    expect(failed?.endedAt).toBeDefined();
+    expect(failed?.warnings.at(-1)).toMatchObject({
+      code: "RECORDER_ERROR",
+      severity: "error",
+    });
+    expect(browser.sendToTab).toHaveBeenCalledWith(
+      11,
+      expect.objectContaining({ type: "worker:stop" }),
+    );
+
+    const retried = (await coordinator.handlePanel({
+      version: 1,
+      type: "panel:start",
+      input: startInput(),
+    })) as ExtensionStateSnapshot;
+
+    expect(retried.session?.phase).toBe("recording");
+    expect(retried.session?.sessionId).not.toBe(failed?.sessionId);
+    expect(configureAttempts).toBe(2);
+  });
+
+  it("converts a rejected configuration message into a recoverable failed session", async () => {
+    const browser = createBrowser();
+    const successfulSendToTab = browser.sendToTab;
+    browser.sendToTab = vi.fn(
+      async (tabId: number, message: unknown): Promise<ContentResponse> => {
+        if ((message as { type: string }).type === "worker:configure") {
+          throw new Error("Receiving end does not exist.");
+        }
+        return successfulSendToTab(tabId, message);
+      },
+    );
+    const coordinator = new ExtensionSessionCoordinator({
+      repository,
+      browser,
+      screenshots: createScreenshots(),
+    });
+
+    await expect(
+      coordinator.handlePanel({
+        version: 1,
+        type: "panel:start",
+        input: startInput(),
+      }),
+    ).rejects.toMatchObject({
+      code: "INSTRUMENTATION_FAILED",
+      recoverable: true,
+    });
+
+    const failed = await repository.getLatestSession();
+    expect(failed?.phase).toBe("failed");
+    expect(failed?.warnings.at(-1)?.message).toContain(
+      "Receiving end does not exist.",
+    );
+  });
+
+  it("fails a stale starting session during worker recovery", async () => {
+    const browser = createBrowser();
+    let currentTime = Date.parse("2026-09-26T12:00:00.000Z");
+    const coordinator = new ExtensionSessionCoordinator({
+      repository,
+      browser,
+      screenshots: createScreenshots(),
+      now: () => new Date((currentTime += 1_000)),
+    });
+    const started = (await coordinator.handlePanel({
+      version: 1,
+      type: "panel:start",
+      input: startInput(),
+    })) as ExtensionStateSnapshot;
+    const sessionId = started.session?.sessionId;
+    if (!sessionId) throw new Error("Expected a session ID.");
+    const stale = await repository.getSession(sessionId);
+    if (!stale) throw new Error("Expected a stored session.");
+    stale.phase = "starting";
+    stale.endedAt = undefined;
+    stale.metadata.endedAt = undefined;
+    stale.metadata.durationMs = 0;
+    await repository.saveSession(stale);
+
+    await coordinator.initialize();
+
+    const recovered = await repository.getSession(sessionId);
+    expect(recovered).toMatchObject({
+      phase: "failed",
+      pageAccess: "degraded",
+    });
+    expect(recovered?.warnings.map(({ code }) => code)).toEqual([
+      "SERVICE_WORKER_RECOVERED",
+      "RECORDER_ERROR",
+    ]);
+    expect(recovered?.endedAt).toBeDefined();
+
+    const retried = (await coordinator.handlePanel({
+      version: 1,
+      type: "panel:start",
+      input: startInput(),
+    })) as ExtensionStateSnapshot;
+    expect(retried.session?.phase).toBe("recording");
+    expect(retried.session?.sessionId).not.toBe(sessionId);
+  });
+
+  it("finishes a stale stopping session during worker recovery", async () => {
+    const browser = createBrowser();
+    const coordinator = new ExtensionSessionCoordinator({
+      repository,
+      browser,
+      screenshots: createScreenshots(),
+    });
+    const started = (await coordinator.handlePanel({
+      version: 1,
+      type: "panel:start",
+      input: startInput(),
+    })) as ExtensionStateSnapshot;
+    const sessionId = started.session?.sessionId;
+    if (!sessionId) throw new Error("Expected a session ID.");
+    const stale = await repository.getSession(sessionId);
+    if (!stale) throw new Error("Expected a stored session.");
+    stale.phase = "stopping";
+    await repository.saveSession(stale);
+
+    await coordinator.initialize();
+
+    const recovered = await repository.getSession(sessionId);
+    expect(recovered?.phase).toBe("stopped");
+    expect(recovered?.warnings).toEqual([
+      expect.objectContaining({ code: "SERVICE_WORKER_RECOVERED" }),
+    ]);
+    expect(browser.sendToTab).toHaveBeenCalledWith(
+      11,
+      expect.objectContaining({ type: "worker:stop" }),
+    );
+  });
+
+  it("keeps recording and reports degraded access when pause is not acknowledged", async () => {
+    const browser = createBrowser();
+    const successfulSendToTab = browser.sendToTab;
+    browser.sendToTab = vi.fn(
+      async (tabId: number, message: unknown): Promise<ContentResponse> => {
+        if ((message as { type: string }).type === "worker:pause") {
+          return {
+            ok: false,
+            message: "The page recorder did not acknowledge pause.",
+          };
+        }
+        return successfulSendToTab(tabId, message);
+      },
+    );
+    const coordinator = new ExtensionSessionCoordinator({
+      repository,
+      browser,
+      screenshots: createScreenshots(),
+    });
+    const started = (await coordinator.handlePanel({
+      version: 1,
+      type: "panel:start",
+      input: startInput(),
+    })) as ExtensionStateSnapshot;
+    const sessionId = started.session?.sessionId;
+    if (!sessionId) throw new Error("Expected a session ID.");
+
+    await expect(
+      coordinator.handlePanel({
+        version: 1,
+        type: "panel:pause",
+        sessionId,
+      }),
+    ).rejects.toMatchObject({ code: "INSTRUMENTATION_FAILED" });
+
+    const session = await repository.getSession(sessionId);
+    expect(session).toMatchObject({
+      phase: "recording",
+      pageAccess: "degraded",
+    });
+    expect(session?.warnings.at(-1)).toMatchObject({
+      code: "PAGE_ACCESS_LOST",
+      severity: "error",
+    });
+  });
+
+  it("remains paused and records a capture gap when resume messaging rejects", async () => {
+    const browser = createBrowser();
+    const successfulSendToTab = browser.sendToTab;
+    let rejectResume = false;
+    browser.sendToTab = vi.fn(
+      async (tabId: number, message: unknown): Promise<ContentResponse> => {
+        if (
+          rejectResume &&
+          (message as { type: string }).type === "worker:resume"
+        ) {
+          throw new Error("The tab navigated before resume completed.");
+        }
+        return successfulSendToTab(tabId, message);
+      },
+    );
+    const coordinator = new ExtensionSessionCoordinator({
+      repository,
+      browser,
+      screenshots: createScreenshots(),
+    });
+    const started = (await coordinator.handlePanel({
+      version: 1,
+      type: "panel:start",
+      input: startInput(),
+    })) as ExtensionStateSnapshot;
+    const sessionId = started.session?.sessionId;
+    if (!sessionId) throw new Error("Expected a session ID.");
+    await coordinator.handlePanel({
+      version: 1,
+      type: "panel:pause",
+      sessionId,
+    });
+    rejectResume = true;
+
+    await expect(
+      coordinator.handlePanel({
+        version: 1,
+        type: "panel:resume",
+        sessionId,
+      }),
+    ).rejects.toMatchObject({ code: "INSTRUMENTATION_FAILED" });
+
+    const session = await repository.getSession(sessionId);
+    expect(session).toMatchObject({ phase: "paused", pageAccess: "degraded" });
+    expect(session?.warnings.at(-1)).toMatchObject({
+      code: "CAPTURE_GAP",
+      severity: "error",
+    });
+    expect(session?.warnings.at(-1)?.message).toContain(
+      "tab navigated before resume completed",
+    );
+  });
+
+  it("finishes stopping but reports cleanup failure when stop is not acknowledged", async () => {
+    const browser = createBrowser();
+    const successfulSendToTab = browser.sendToTab;
+    browser.sendToTab = vi.fn(
+      async (tabId: number, message: unknown): Promise<ContentResponse> => {
+        if ((message as { type: string }).type === "worker:stop") {
+          return { ok: true, type: "resumed" };
+        }
+        return successfulSendToTab(tabId, message);
+      },
+    );
+    const coordinator = new ExtensionSessionCoordinator({
+      repository,
+      browser,
+      screenshots: createScreenshots(),
+    });
+    const started = (await coordinator.handlePanel({
+      version: 1,
+      type: "panel:start",
+      input: startInput(),
+    })) as ExtensionStateSnapshot;
+    const sessionId = started.session?.sessionId;
+    if (!sessionId) throw new Error("Expected a session ID.");
+
+    const stopped = (await coordinator.handlePanel({
+      version: 1,
+      type: "panel:stop",
+      sessionId,
+    })) as ExtensionStateSnapshot;
+
+    expect(stopped.session).toMatchObject({
+      phase: "stopped",
+      pageAccess: "degraded",
+    });
+    expect(stopped.session?.warnings.at(-1)).toMatchObject({
+      code: "RECORDER_ERROR",
+      severity: "error",
+    });
+  });
+
   it("rejects evidence from another tab or a stale lease", async () => {
     const coordinator = new ExtensionSessionCoordinator({
       repository,

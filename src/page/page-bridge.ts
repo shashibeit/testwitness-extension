@@ -33,9 +33,9 @@ interface PageBridgeController {
     config: ResolvedTestWitnessConfig,
     paused: boolean,
   ): void;
-  pause(sessionId: string, leaseId: string): void;
-  resume(sessionId: string, leaseId: string): void;
-  stop(sessionId: string, leaseId: string): void;
+  pause(sessionId: string, leaseId: string): boolean;
+  resume(sessionId: string, leaseId: string): boolean;
+  stop(sessionId: string, leaseId: string): boolean;
 }
 
 interface PageGlobal extends Window {
@@ -51,7 +51,10 @@ function isControlMessage(value: unknown): value is PageBridgeControlMessage {
   if (!["configure", "pause", "resume", "stop"].includes(String(value.type)))
     return false;
   return (
-    typeof value.sessionId === "string" && typeof value.leaseId === "string"
+    typeof value.controlId === "string" &&
+    value.controlId.length <= 160 &&
+    typeof value.sessionId === "string" &&
+    typeof value.leaseId === "string"
   );
 }
 
@@ -61,12 +64,14 @@ function installBridge(): PageBridgeController {
   function emitStatus(
     sessionId: string,
     leaseId: string,
+    controlId: string,
     type: PageBridgeStatusMessage["type"],
     message?: string,
   ): void {
     const status: PageBridgeStatusMessage = {
       channel: PAGE_STATUS_CHANNEL,
       type,
+      controlId,
       sessionId,
       leaseId,
       ...(message ? { message: message.slice(0, 1_000) } : {}),
@@ -165,20 +170,23 @@ function installBridge(): PageBridgeController {
       }
     },
     pause(sessionId, leaseId) {
-      if (!matches(sessionId, leaseId)) return;
+      if (!matches(sessionId, leaseId)) return false;
       active?.actionRecorder.pause();
       active?.consoleRecorder.pause();
       active?.networkRecorder.pause();
+      return true;
     },
     resume(sessionId, leaseId) {
-      if (!matches(sessionId, leaseId)) return;
+      if (!matches(sessionId, leaseId)) return false;
       active?.actionRecorder.resume();
       active?.consoleRecorder.resume();
       active?.networkRecorder.resume();
+      return true;
     },
     stop(sessionId, leaseId) {
-      if (!matches(sessionId, leaseId)) return;
+      if (!matches(sessionId, leaseId)) return false;
       stopActive();
+      return true;
     },
   };
 
@@ -193,11 +201,17 @@ function installBridge(): PageBridgeController {
           message.config,
           message.paused,
         );
-        emitStatus(message.sessionId, message.leaseId, "configured");
+        emitStatus(
+          message.sessionId,
+          message.leaseId,
+          message.controlId,
+          "configured",
+        );
       } catch (error) {
         emitStatus(
           message.sessionId,
           message.leaseId,
+          message.controlId,
           "configuration-error",
           error instanceof Error
             ? error.message
@@ -205,7 +219,44 @@ function installBridge(): PageBridgeController {
         );
       }
     } else {
-      controller[message.type](message.sessionId, message.leaseId);
+      try {
+        const applied = controller[message.type](
+          message.sessionId,
+          message.leaseId,
+        );
+        if (!applied) {
+          emitStatus(
+            message.sessionId,
+            message.leaseId,
+            message.controlId,
+            "control-error",
+            "The page capture lease is stale.",
+          );
+          return;
+        }
+        const statusType =
+          message.type === "pause"
+            ? "paused"
+            : message.type === "resume"
+              ? "resumed"
+              : "stopped";
+        emitStatus(
+          message.sessionId,
+          message.leaseId,
+          message.controlId,
+          statusType,
+        );
+      } catch (error) {
+        emitStatus(
+          message.sessionId,
+          message.leaseId,
+          message.controlId,
+          "control-error",
+          error instanceof Error
+            ? error.message
+            : `Page instrumentation could not ${message.type}.`,
+        );
+      }
     }
   });
 

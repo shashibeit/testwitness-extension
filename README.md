@@ -151,13 +151,15 @@ If any captured content violates privacy or retention rules, do not distribute t
 
 ## Developer repository relationship
 
-For local development, `package.json` uses:
+The extension is maintained in a separate repository and consumes the public, exact core release:
 
 ```json
-"@testwitness/core": "file:../testwitness"
+"@testwitness/core": "0.1.0"
 ```
 
-The folders should therefore be siblings:
+An exact version keeps extension builds reproducible. A sibling core checkout is not required for normal installation, validation, or store packaging.
+
+When developing coordinated changes in both repositories, keep them as siblings and temporarily link the locally built core package:
 
 ```text
 Jarvis/
@@ -165,7 +167,19 @@ Jarvis/
 └── testwitness-extension/
 ```
 
-Before independent CI or store publication, publish `@testwitness/core` and replace the local dependency with an exact released version.
+```bash
+cd testwitness
+npm ci
+npm run build
+npm link
+
+cd ../testwitness-extension
+npm ci
+npm link @testwitness/core
+npm run validate
+```
+
+Run `npm ci` in the extension again to restore the pinned registry dependency after local cross-repository testing. Do not commit the temporary npm link or generated build output.
 
 ## Developer prerequisites
 
@@ -173,29 +187,16 @@ Before independent CI or store publication, publish `@testwitness/core` and repl
 - npm
 - Git
 - Google Chrome 116 or newer, or a compatible Microsoft Edge release
-- The sibling `testwitness` core project
 
 Chrome 116 is the minimum because the service worker obtains a tab stream ID and the offscreen document consumes that stream.
 
 ## Build from source
 
-Clone both repositories into the same parent directory, then build the core dependency first:
+Clone and validate the extension. npm installs the pinned `@testwitness/core` release from the public registry:
 
 ```bash
-mkdir testwitness-workspace
-cd testwitness-workspace
-git clone https://github.com/shashibeit/testwitness.git
 git clone https://github.com/shashibeit/testwitness-extension.git
-
-cd testwitness
-npm ci
-npm run build
-```
-
-Then install and validate the extension:
-
-```bash
-cd ../testwitness-extension
+cd testwitness-extension
 npm ci
 npm run validate
 ```
@@ -480,17 +481,14 @@ Removing the extension removes its extension-origin storage, including locally r
 
 ## Developer and contributor workflow
 
-Keep `testwitness` and `testwitness-extension` as sibling directories while the extension uses the local core dependency. Build the core first, then validate the extension:
+Install the exact dependency versions from `package-lock.json`, then validate the extension:
 
 ```bash
-cd ../testwitness
-npm install
-npm run build
-
-cd ../testwitness-extension
-npm install
+npm ci
 npm run validate
 ```
+
+For changes that must be tested against an unpublished core checkout, use the temporary npm-link workflow in [Developer repository relationship](#developer-repository-relationship), then run `npm ci` afterward to return to the released dependency.
 
 `npm run validate` is the minimum automated check before a pull request. It does not replace the manual Chrome/Edge test matrix, especially for real tab video, browser permission UI, side-panel behavior, WebM codecs/playback, screenshot privacy, or enterprise browser policies.
 
@@ -512,7 +510,7 @@ npm run validate      # tests + typecheck + lint + format + build
 
 - Perform and record the manual Chrome and Edge test matrix.
 - Add a public privacy policy and data-use disclosure.
-- Replace the sibling file dependency with a released `@testwitness/core` version.
+- Add automated compatibility checks for future `@testwitness/core` releases before upgrading the pinned version.
 - Add signed store artwork, screenshots, support URL, and release notes.
 - Validate managed-browser and enterprise DLP behavior.
 - Add Playwright coverage for the unpacked extension where the CI browser supports side panels.

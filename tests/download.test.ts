@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import JSZip from "jszip";
 
 import { downloadEvidence } from "../src/evidence/download";
 import { IndexedDbEvidenceRepository } from "../src/storage/IndexedDbEvidenceRepository";
@@ -66,5 +67,52 @@ describe("extension evidence download", () => {
         saveAs: true,
       }),
     );
+  });
+
+  it("includes extension capture-health warnings in the offline report", async () => {
+    const session = createStoredSession({
+      phase: "stopped",
+      endedAt: "2026-09-26T12:05:00.000Z",
+      warnings: [
+        {
+          code: "CAPTURE_GAP",
+          message: "Page evidence was unavailable during navigation.",
+          timestamp: "2026-09-26T12:02:00.000Z",
+          severity: "warning",
+        },
+      ],
+    });
+    await repository.saveSession(session);
+
+    let exportedBlob: Blob | undefined;
+    vi.stubGlobal("chrome", { downloads: { download: vi.fn(async () => 42) } });
+    vi.spyOn(URL, "createObjectURL").mockImplementation((blob) => {
+      if (blob instanceof Blob) exportedBlob = blob;
+      return "blob:testwitness-export";
+    });
+    vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => undefined);
+
+    await downloadEvidence(repository, session.sessionId);
+
+    expect(exportedBlob).toBeDefined();
+    const zip = await JSZip.loadAsync(await exportedBlob!.arrayBuffer());
+    const report = await zip.file("report.html")?.async("string");
+    const manifest = JSON.parse(
+      (await zip.file("evidence-manifest.json")?.async("string")) ?? "",
+    ) as Record<string, unknown>;
+    expect(report).toContain("CAPTURE_GAP");
+    expect(report).toContain(
+      "Page evidence was unavailable during navigation.",
+    );
+    expect(report).toContain("extension");
+    expect(manifest).toMatchObject({
+      schemaVersion: 1,
+      format: "testwitness-evidence",
+      captureWarningCount: 1,
+      producer: {
+        name: "TestWitness",
+        libraryVersion: "@testwitness/extension-standard/0.1.0",
+      },
+    });
   });
 });

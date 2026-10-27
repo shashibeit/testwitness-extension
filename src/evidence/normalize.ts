@@ -49,6 +49,9 @@ const FAILURES = new Set<NetworkFailureType>([
   "timeout",
   "abort",
 ]);
+const NON_TEXT_INPUT_STATES = new Set(["checked", "unchecked"]);
+const FORBIDDEN_INPUT_TYPE_PATTERN =
+  /(?:^|[\s[.#])type\s*=\s*["']?(?:password|hidden|file)(?:["'\]\s.#]|$)/iu;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -166,18 +169,45 @@ function networkDetails(
 function normalizeAction(
   value: unknown,
   sanitizer: DataSanitizer,
+  config: ResolvedTestWitnessConfig,
   sequence: number,
 ): ActionRecord | undefined {
   if (!isRecord(value) || !ACTION_TYPES.has(value.type as ActionType))
     return undefined;
+
+  const type = value.type as ActionType;
+  const elementTag = optionalString(value.elementTag, sanitizer, 60);
+  const elementIdentifier = optionalString(
+    value.elementIdentifier,
+    sanitizer,
+    500,
+  );
+  const rawValue = typeof value.value === "string" ? value.value : undefined;
+  const targetDescription = `${elementTag ?? ""} ${elementIdentifier ?? ""}`;
+  const targetIsSensitive =
+    sanitizer.isSensitiveFieldName(targetDescription) ||
+    FORBIDDEN_INPUT_TYPE_PATTERN.test(targetDescription);
+
+  let actionValue: string | undefined;
+  if (type === "input-change" && rawValue !== undefined && !targetIsSensitive) {
+    if (config.actions.captureTextInputValues) {
+      actionValue = sanitizer.sanitizeText(rawValue, 200);
+    } else if (NON_TEXT_INPUT_STATES.has(rawValue)) {
+      // Checkbox/radio state is the only value emitted by the core recorder
+      // while text-value capture is disabled. Re-apply that policy here because
+      // page-world messages are observable and must be treated as untrusted.
+      actionValue = rawValue;
+    }
+  }
+
   return {
     sequence,
     timestamp: safeTimestamp(value.timestamp),
-    type: value.type as ActionType,
-    elementTag: optionalString(value.elementTag, sanitizer, 60),
-    elementIdentifier: optionalString(value.elementIdentifier, sanitizer, 500),
+    type,
+    elementTag,
+    elementIdentifier,
     elementText: optionalString(value.elementText, sanitizer, 200),
-    value: optionalString(value.value, sanitizer, 200),
+    ...(actionValue === undefined ? {} : { value: actionValue }),
     url: sanitizer.sanitizeUrl(typeof value.url === "string" ? value.url : ""),
   };
 }
@@ -269,6 +299,7 @@ export function normalizeEvidenceCandidate(
       const record = normalizeAction(
         candidate.record,
         sanitizer,
+        config,
         actionSequence,
       );
       return record ? { kind: "action", record } : undefined;

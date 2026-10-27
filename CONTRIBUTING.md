@@ -17,7 +17,16 @@ For security vulnerabilities, do not open a public issue containing sensitive de
 
 ## Repository layout and core dependency
 
-This project deliberately remains separate from the TestWitness core SDK, but its development dependency uses a sibling checkout:
+This project remains separate from the TestWitness core SDK and uses the exact public `@testwitness/core` version recorded in `package.json` and `package-lock.json`. A core checkout is not required for normal extension development:
+
+```bash
+git clone https://github.com/shashibeit/testwitness-extension.git
+cd testwitness-extension
+npm ci
+npm run validate
+```
+
+For coordinated, unpublished changes in both repositories, the projects may be checked out as siblings:
 
 ```text
 workspace/
@@ -25,22 +34,21 @@ workspace/
 └── testwitness-extension/
 ```
 
-The extension's `package.json` declares `@testwitness/core` as `file:../testwitness`. Clone both repositories into the same parent directory and build the core package before installing or validating the extension:
+Build and temporarily link the local core package without changing the committed dependency:
 
 ```bash
-git clone https://github.com/shashibeit/testwitness.git
-git clone https://github.com/shashibeit/testwitness-extension.git
-
 cd testwitness
 npm ci
 npm run build
+npm link
 
 cd ../testwitness-extension
 npm ci
+npm link @testwitness/core
 npm run validate
 ```
 
-Do not replace the sibling dependency with an unpublished path or commit generated `node_modules`, `dist`, coverage, artifact, or ZIP files. A release workflow may replace the local dependency with a published, pinned core version.
+Run `npm ci` in the extension afterward to restore the pinned registry package. Do not commit a temporary link or generated `node_modules`, `dist`, coverage, artifact, or ZIP files. Upgrade the pinned core version deliberately, regenerate the lockfile, and validate the complete extension before committing.
 
 ## Development commands
 

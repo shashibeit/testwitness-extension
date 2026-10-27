@@ -17,6 +17,7 @@ import type { PageContext } from "../shared/types";
 const INSTALLATION_KEY = "__testWitnessContentScriptV1__";
 const MASK_HOST_ATTRIBUTE = "data-testwitness-privacy-mask";
 const MAX_BRIDGE_MESSAGE_BYTES = 256 * 1024;
+const PAGE_CONTROL_TIMEOUT_MS = 2_000;
 
 const MANDATORY_PRIVACY_SELECTORS = [
   'input[type="password"]',
@@ -235,13 +236,22 @@ function parseBridgeStatus(
   value: unknown,
   sessionId: string,
   leaseId: string,
+  controlId: string,
 ): PageBridgeStatusMessage | undefined {
   if (
     !isRecord(value) ||
     value.channel !== PAGE_STATUS_CHANNEL ||
     value.sessionId !== sessionId ||
     value.leaseId !== leaseId ||
-    !["configured", "configuration-error"].includes(String(value.type))
+    value.controlId !== controlId ||
+    ![
+      "configured",
+      "paused",
+      "resumed",
+      "stopped",
+      "configuration-error",
+      "control-error",
+    ].includes(String(value.type))
   ) {
     return undefined;
   }
@@ -253,8 +263,11 @@ function parseBridgeStatus(
 
 function install(): void {
   let session: ContentSession | undefined;
-  let pendingConfiguration:
+  let controlSequence = 0;
+  let pendingControl:
     | {
+        operation: "configure" | "pause" | "resume" | "stop";
+        controlId: string;
         sessionId: string;
         leaseId: string;
         timer: number;
@@ -262,51 +275,76 @@ function install(): void {
       }
     | undefined;
 
-  function waitForConfiguration(
+  function nextControlId(): string {
+    controlSequence += 1;
+    return `control-${Date.now().toString(36)}-${controlSequence.toString(36)}`;
+  }
+
+  function waitForPageControl(
+    operation: "configure" | "pause" | "resume" | "stop",
+    controlId: string,
     sessionId: string,
     leaseId: string,
   ): Promise<PageBridgeStatusMessage> {
-    if (pendingConfiguration) {
-      window.clearTimeout(pendingConfiguration.timer);
-      pendingConfiguration.resolve({
+    if (pendingControl) {
+      window.clearTimeout(pendingControl.timer);
+      pendingControl.resolve({
         channel: PAGE_STATUS_CHANNEL,
-        type: "configuration-error",
-        sessionId: pendingConfiguration.sessionId,
-        leaseId: pendingConfiguration.leaseId,
-        message: "Page instrumentation was replaced by a newer request.",
+        type:
+          pendingControl.operation === "configure"
+            ? "configuration-error"
+            : "control-error",
+        controlId: pendingControl.controlId,
+        sessionId: pendingControl.sessionId,
+        leaseId: pendingControl.leaseId,
+        message: "Page control was replaced by a newer request.",
       });
     }
     return new Promise((resolve) => {
       const timer = window.setTimeout(() => {
         if (
-          pendingConfiguration?.sessionId === sessionId &&
-          pendingConfiguration.leaseId === leaseId
+          pendingControl?.controlId === controlId &&
+          pendingControl.sessionId === sessionId &&
+          pendingControl.leaseId === leaseId
         ) {
-          pendingConfiguration = undefined;
+          pendingControl = undefined;
         }
         resolve({
           channel: PAGE_STATUS_CHANNEL,
-          type: "configuration-error",
+          type:
+            operation === "configure" ? "configuration-error" : "control-error",
+          controlId,
           sessionId,
           leaseId,
-          message: "The page recorder did not acknowledge startup.",
+          message:
+            operation === "configure"
+              ? "The page recorder did not acknowledge startup."
+              : `The page recorder did not acknowledge ${operation}.`,
         });
-      }, 2_000);
-      pendingConfiguration = { sessionId, leaseId, timer, resolve };
+      }, PAGE_CONTROL_TIMEOUT_MS);
+      pendingControl = {
+        operation,
+        controlId,
+        sessionId,
+        leaseId,
+        timer,
+        resolve,
+      };
     });
   }
 
   window.addEventListener("message", (event: MessageEvent<unknown>) => {
     if (event.source !== window) return;
-    if (pendingConfiguration) {
+    if (pendingControl) {
       const status = parseBridgeStatus(
         event.data,
-        pendingConfiguration.sessionId,
-        pendingConfiguration.leaseId,
+        pendingControl.sessionId,
+        pendingControl.leaseId,
+        pendingControl.controlId,
       );
       if (status) {
-        const { resolve, timer } = pendingConfiguration;
-        pendingConfiguration = undefined;
+        const { resolve, timer } = pendingControl;
+        pendingControl = undefined;
         window.clearTimeout(timer);
         resolve(status);
         return;
@@ -340,19 +378,23 @@ function install(): void {
       case "worker:get-context":
         return { ok: true, type: "context", context: pageContext() };
       case "worker:configure": {
+        const controlId = nextControlId();
         session = {
           sessionId: message.sessionId,
           leaseId: message.leaseId,
           config: message.config,
           paused: message.paused,
         };
-        const configuration = waitForConfiguration(
+        const configuration = waitForPageControl(
+          "configure",
+          controlId,
           message.sessionId,
           message.leaseId,
         );
         postPageControl({
           channel: PAGE_CONTROL_CHANNEL,
           type: "configure",
+          controlId,
           sessionId: message.sessionId,
           leaseId: message.leaseId,
           config: message.config,
@@ -378,24 +420,43 @@ function install(): void {
         ) {
           return { ok: false, message: "The page capture lease is stale." };
         }
+        const operation = message.type.replace("worker:", "") as
+          "pause" | "resume" | "stop";
+        const expectedType =
+          operation === "pause"
+            ? "paused"
+            : operation === "resume"
+              ? "resumed"
+              : "stopped";
+        const controlId = nextControlId();
+        const acknowledgement = waitForPageControl(
+          operation,
+          controlId,
+          message.sessionId,
+          message.leaseId,
+        );
         postPageControl({
           channel: PAGE_CONTROL_CHANNEL,
-          type: message.type.replace("worker:", "") as
-            "pause" | "resume" | "stop",
+          type: operation,
+          controlId,
           sessionId: message.sessionId,
           leaseId: message.leaseId,
         });
+        const status = await acknowledgement;
+        if (status.type !== expectedType) {
+          return {
+            ok: false,
+            message:
+              status.message ||
+              `The page recorder did not confirm ${operation}.`,
+          };
+        }
         if (message.type === "worker:pause") session.paused = true;
         if (message.type === "worker:resume") session.paused = false;
         if (message.type === "worker:stop") session = undefined;
         return {
           ok: true,
-          type:
-            message.type === "worker:pause"
-              ? "paused"
-              : message.type === "worker:resume"
-                ? "resumed"
-                : "stopped",
+          type: expectedType,
         };
       }
       case "worker:prepare-screenshot":

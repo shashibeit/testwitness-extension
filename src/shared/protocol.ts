@@ -130,6 +130,7 @@ export type PageBridgeControlMessage =
   | {
       channel: typeof PAGE_CONTROL_CHANNEL;
       type: "configure";
+      controlId: string;
       sessionId: string;
       leaseId: string;
       config: StoredSession["config"];
@@ -138,6 +139,7 @@ export type PageBridgeControlMessage =
   | {
       channel: typeof PAGE_CONTROL_CHANNEL;
       type: "pause" | "resume" | "stop";
+      controlId: string;
       sessionId: string;
       leaseId: string;
     };
@@ -151,7 +153,14 @@ export interface PageBridgeEvidenceMessage {
 
 export interface PageBridgeStatusMessage {
   channel: typeof PAGE_STATUS_CHANNEL;
-  type: "configured" | "configuration-error";
+  type:
+    | "configured"
+    | "paused"
+    | "resumed"
+    | "stopped"
+    | "configuration-error"
+    | "control-error";
+  controlId: string;
   sessionId: string;
   leaseId: string;
   message?: string;

@@ -22,6 +22,7 @@ import { ExtensionError } from "../shared/errors";
 import { createId, createSessionId } from "../shared/ids";
 import {
   PROTOCOL_VERSION,
+  type ContentResponse,
   type ContentRuntimeMessage,
   type OffscreenEventMessage,
   type PanelMessage,
@@ -223,6 +224,41 @@ export class ExtensionSessionCoordinator {
     await this.enqueue(async () => {
       const latest = await this.#repository.getLatestSession();
       if (!latest || !ACTIVE_PHASES.has(latest.phase)) return;
+
+      if (latest.phase === "starting") {
+        addWarning(
+          latest,
+          warning(
+            "SERVICE_WORKER_RECOVERED",
+            "The extension worker restarted before session startup completed.",
+            "info",
+          ),
+        );
+        await this.failStartingSession(
+          latest,
+          new ExtensionError(
+            "INSTRUMENTATION_FAILED",
+            "Session startup was interrupted. Start a new session to resume evidence capture.",
+          ),
+        );
+        return;
+      }
+
+      if (latest.phase === "stopping") {
+        addWarning(
+          latest,
+          warning(
+            "SERVICE_WORKER_RECOVERED",
+            "The extension worker restarted while the session was stopping. Finalization was resumed.",
+            "info",
+          ),
+        );
+        touch(latest, this.#now());
+        await this.#repository.saveSession(latest);
+        await this.stopSession(latest.sessionId);
+        return;
+      }
+
       addWarning(
         latest,
         warning(
@@ -638,10 +674,15 @@ export class ExtensionSessionCoordinator {
       updatedAt: startedAt.toISOString(),
     };
     await this.#repository.saveSession(session);
-    await this.configurePage(session);
-    session.phase = "recording";
-    touch(session, this.#now());
-    await this.#repository.saveSession(session);
+    try {
+      await this.configurePage(session);
+      session.phase = "recording";
+      touch(session, this.#now());
+      await this.#repository.saveSession(session);
+    } catch (error) {
+      await this.failStartingSession(session, error);
+      throw error;
+    }
     await this.updateBadge(session);
     await this.broadcastState();
 
@@ -663,14 +704,20 @@ export class ExtensionSessionCoordinator {
         "Only a recording session can be paused.",
       );
     }
-    await this.#browser
-      .sendToTab(session.targetTabId, {
-        version: PROTOCOL_VERSION,
-        type: "worker:pause",
-        sessionId,
-        leaseId: session.leaseId,
-      })
-      .catch(() => undefined);
+    try {
+      await this.controlPage(session, "pause", "paused");
+    } catch (error) {
+      const controlError = this.pageControlError("pause", error);
+      this.recordPageControlFailure(
+        session,
+        "PAGE_ACCESS_LOST",
+        `The page recorder did not pause. The session remains recording: ${controlError.message}`,
+      );
+      await this.#repository.saveSession(session);
+      await this.updateBadge(session);
+      await this.broadcastState();
+      throw controlError;
+    }
     if (session.videoStatus === "recording") {
       await this.#browser.sendOffscreen({
         version: PROTOCOL_VERSION,
@@ -697,14 +744,20 @@ export class ExtensionSessionCoordinator {
         "Only a paused session can be resumed.",
       );
     }
-    await this.#browser
-      .sendToTab(session.targetTabId, {
-        version: PROTOCOL_VERSION,
-        type: "worker:resume",
-        sessionId,
-        leaseId: session.leaseId,
-      })
-      .catch(() => undefined);
+    try {
+      await this.controlPage(session, "resume", "resumed");
+    } catch (error) {
+      const controlError = this.pageControlError("resume", error);
+      this.recordPageControlFailure(
+        session,
+        "CAPTURE_GAP",
+        `The page recorder did not resume. Page evidence remains paused: ${controlError.message}`,
+      );
+      await this.#repository.saveSession(session);
+      await this.updateBadge(session);
+      await this.broadcastState();
+      throw controlError;
+    }
     if (session.videoStatus === "paused") {
       await this.#browser.sendOffscreen({
         version: PROTOCOL_VERSION,
@@ -844,14 +897,16 @@ export class ExtensionSessionCoordinator {
     await this.#repository.saveSession(session);
     await this.broadcastState();
 
-    await this.#browser
-      .sendToTab(session.targetTabId, {
-        version: PROTOCOL_VERSION,
-        type: "worker:stop",
-        sessionId,
-        leaseId: session.leaseId,
-      })
-      .catch(() => undefined);
+    try {
+      await this.controlPage(session, "stop", "stopped");
+    } catch (error) {
+      const controlError = this.pageControlError("stop", error);
+      this.recordPageControlFailure(
+        session,
+        "RECORDER_ERROR",
+        `The page recorder did not confirm cleanup while the session stopped: ${controlError.message}`,
+      );
+    }
     if (
       session.videoStatus === "finalizing" ||
       session.videoStatus === "requesting-permission"
@@ -950,14 +1005,24 @@ export class ExtensionSessionCoordinator {
   }
 
   private async configurePage(session: StoredSession): Promise<void> {
-    const response = await this.#browser.sendToTab(session.targetTabId, {
-      version: PROTOCOL_VERSION,
-      type: "worker:configure",
-      sessionId: session.sessionId,
-      leaseId: session.leaseId,
-      config: session.config,
-      paused: session.phase === "paused",
-    });
+    let response: ContentResponse;
+    try {
+      response = await this.#browser.sendToTab(session.targetTabId, {
+        version: PROTOCOL_VERSION,
+        type: "worker:configure",
+        sessionId: session.sessionId,
+        leaseId: session.leaseId,
+        config: session.config,
+        paused: session.phase === "paused",
+      });
+    } catch (error) {
+      throw new ExtensionError(
+        "INSTRUMENTATION_FAILED",
+        error instanceof Error
+          ? `Page instrumentation could not be configured: ${error.message}`
+          : "Page instrumentation could not be configured.",
+      );
+    }
     if (!response.ok || response.type !== "configured") {
       throw new ExtensionError(
         "INSTRUMENTATION_FAILED",
@@ -966,6 +1031,101 @@ export class ExtensionSessionCoordinator {
           : response.message,
       );
     }
+  }
+
+  private async controlPage(
+    session: StoredSession,
+    operation: "pause" | "resume" | "stop",
+    expectedType: "paused" | "resumed" | "stopped",
+  ): Promise<void> {
+    let response: ContentResponse;
+    try {
+      response = await this.#browser.sendToTab(session.targetTabId, {
+        version: PROTOCOL_VERSION,
+        type: `worker:${operation}`,
+        sessionId: session.sessionId,
+        leaseId: session.leaseId,
+      });
+    } catch (error) {
+      throw this.pageControlError(operation, error);
+    }
+    if (!response.ok || response.type !== expectedType) {
+      throw new ExtensionError(
+        "INSTRUMENTATION_FAILED",
+        response.ok
+          ? `The page recorder returned an unexpected response while attempting to ${operation}.`
+          : response.message ||
+              `The page recorder could not ${operation} the session.`,
+      );
+    }
+  }
+
+  private pageControlError(
+    operation: "pause" | "resume" | "stop",
+    error: unknown,
+  ): ExtensionError {
+    if (error instanceof ExtensionError) return error;
+    const detail = error instanceof Error ? error.message : String(error);
+    return new ExtensionError(
+      "INSTRUMENTATION_FAILED",
+      detail
+        ? `Page instrumentation could not ${operation}: ${detail}`
+        : `Page instrumentation could not ${operation}.`,
+    );
+  }
+
+  private recordPageControlFailure(
+    session: StoredSession,
+    code: "PAGE_ACCESS_LOST" | "CAPTURE_GAP" | "RECORDER_ERROR",
+    message: string,
+  ): void {
+    const sanitizer = new DataSanitizer(session.config.privacy);
+    session.pageAccess = "degraded";
+    addWarning(
+      session,
+      warning(code, sanitizer.sanitizeText(message, 1_000), "error"),
+    );
+    touch(session, this.#now());
+  }
+
+  private async failStartingSession(
+    session: StoredSession,
+    error: unknown,
+  ): Promise<void> {
+    const sanitizer = new DataSanitizer(session.config.privacy);
+    const detail = sanitizer.sanitizeText(
+      error instanceof Error ? error.message : String(error),
+      500,
+    );
+    addWarning(
+      session,
+      warning(
+        "RECORDER_ERROR",
+        detail
+          ? `Session startup failed: ${detail}`
+          : "Session startup failed before page instrumentation was ready.",
+        "error",
+      ),
+    );
+    session.phase = "failed";
+    session.pageAccess = "degraded";
+    session.videoStatus = session.preferences.captureVideo
+      ? "unavailable"
+      : "off";
+    this.finalizeMetadata(session, undefined);
+    touch(session, this.#now());
+
+    await this.#browser
+      .sendToTab(session.targetTabId, {
+        version: PROTOCOL_VERSION,
+        type: "worker:stop",
+        sessionId: session.sessionId,
+        leaseId: session.leaseId,
+      })
+      .catch(() => undefined);
+    await this.#repository.saveSession(session);
+    await this.updateBadge(session);
+    await this.broadcastState().catch(() => undefined);
   }
 
   private async getPageContext(tabId: number): Promise<PageContext> {

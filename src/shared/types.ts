@@ -144,20 +144,14 @@ export function toCoreSummary(session: StoredSession): SessionSummary {
     videoStatus: session.videoStatus,
     videoRecording:
       session.videoStatus === "recording" || session.videoStatus === "paused",
-    warnings: session.warnings
-      .filter(
-        (
-          warning,
-        ): warning is ExtensionWarning & { code: SessionWarning["code"] } =>
-          [
-            "VIDEO_UNAVAILABLE",
-            "VIDEO_ENDED",
-            "CAPTURE_FAILED",
-            "SCREENSHOT_LIMIT_REACHED",
-            "MEMORY_THRESHOLD_REACHED",
-            "RECORDER_ERROR",
-          ].includes(warning.code),
-      )
-      .map(({ code, message, timestamp }) => ({ code, message, timestamp })),
+    warnings: session.warnings.map(
+      ({ code, message, timestamp, severity }): SessionWarning => ({
+        code,
+        message,
+        timestamp,
+        severity,
+        source: "extension",
+      }),
+    ),
   };
 }
